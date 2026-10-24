@@ -12,8 +12,13 @@
 //   KUMA_ADMIN_USER, KUMA_ADMIN_PASSWORD  Kuma's admin, created at the first start
 //   SYNC_INTERVAL (60 s), MONITOR_INTERVAL (60 s), KUMA_URL (http://localhost:3001)
 //   SELF_HOST                         this app's own host, not monitored
+//   SSO_ENABLED, SSO_EMAILS_FILE      set by start.sh when oauth2-proxy guards the page: the
+//                                     file gets the emails of the cluster's users holding
+//                                     cluster-show-routes, and Kuma's own login is turned off;
+//                                     without SSO, Kuma's login is kept on
 "use strict";
 const { io } = require("/app/node_modules/socket.io-client");
+const fs = require("fs");
 const https = require("https");
 const http = require("http");
 
@@ -29,6 +34,8 @@ const CHECK_INTERVAL = Math.max(20, Number(env.MONITOR_INTERVAL) || 60);
 const SELF_HOST = env.SELF_HOST || "";
 const TLS_VERIFY = String(env.REPMAN_API_TLS_VERIFY || "true").toLowerCase() !== "false";
 const MARK = `managed by kuma-sync (${CLUSTER})`;
+const SSO = env.SSO_ENABLED === "true";
+const SSO_EMAILS_FILE = env.SSO_EMAILS_FILE || "";
 
 const log = (...a) => console.log(new Date().toISOString(), "kuma-sync:", ...a);
 const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
@@ -147,6 +154,46 @@ async function desired() {
     return want;
 }
 
+// writeViewers writes the emails allowed through oauth2-proxy (one per line), replacing the file
+// in one rename so oauth2-proxy never reads half of it. A failed read keeps the current list.
+async function writeViewers() {
+    const emails = await api(`/api/clusters/${encodeURIComponent(CLUSTER)}/users/route-viewers`);
+    if (!Array.isArray(emails)) {
+        throw new Error("route-viewers: not a list");
+    }
+    const content = emails.filter((e) => typeof e === "string" && /^[^\s@]+@[^\s@]+$/.test(e)).join("\n") + "\n";
+    let current = "";
+    try {
+        current = fs.readFileSync(SSO_EMAILS_FILE, "utf8");
+    } catch (e) {
+        // first write
+    }
+    if (current === content) {
+        return;
+    }
+    fs.writeFileSync(SSO_EMAILS_FILE + ".tmp", content, { mode: 0o600 });
+    fs.renameSync(SSO_EMAILS_FILE + ".tmp", SSO_EMAILS_FILE);
+    log(`SSO: ${emails.length} user(s) with cluster-show-routes on ${CLUSTER} may open the page`);
+}
+
+// kumaLogin keeps Kuma's own login off behind the SSO and on without it: with the SSO, Kuma
+// listens on 127.0.0.1 only and oauth2-proxy has checked the person.
+async function kumaLogin(sock) {
+    const s = await call(sock, "getSettings");
+    if (!s || !s.ok) {
+        throw new Error(`getSettings: ${s && s.msg}`);
+    }
+    const data = s.data || {};
+    if (Boolean(data.disableAuth) === SSO) {
+        return;
+    }
+    const r = await call(sock, "setSettings", { ...data, disableAuth: SSO }, PASSWORD);
+    if (!r || !r.ok) {
+        throw new Error(`setSettings: ${r && r.msg}`);
+    }
+    log(`Kuma's own login ${SSO ? "off (SSO in front)" : "on (no SSO)"}`);
+}
+
 function newMonitor(name, fields) {
     return {
         name,
@@ -219,6 +266,11 @@ async function session() {
         }
         if (list === null) {
             throw new Error("no monitor list from Kuma");
+        }
+
+        await kumaLogin(sock);
+        if (SSO) {
+            await writeViewers();
         }
 
         // a failed read of the cluster changes nothing: never remove monitors on an API error
