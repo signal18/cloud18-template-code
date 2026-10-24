@@ -76,12 +76,8 @@ async function desired() {
         if (!app.host || app.host === SELF_HOST) {
             continue;
         }
-        let routes = [];
-        try {
-            routes = (await api(`/api/clusters/${c}/apps/${encodeURIComponent(app.id)}/deployment`)).routes || [];
-        } catch (e) {
-            log(`app ${app.name}: no routes read (${e.message}), checked on its port`);
-        }
+        // the app's routes come with the topology (replication-manager #2158): no deployment read
+        const routes = app.routes || [];
         // one check per internal address: two public names on the same port and path share it
         const checks = new Map();
         const monitoredPorts = new Set(routes.filter((r) => r.monitor && r.monitor.path).map((r) => r.destPort || r.port || app.port));
