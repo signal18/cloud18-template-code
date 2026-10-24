@@ -6,12 +6,16 @@
 //
 // Environment:
 //   REPMAN_API_URL, REPMAN_API_TOKEN  replication-manager API and a read-only API token
+//   REPMAN_API_TLS_VERIFY             "false" accepts the API's self-signed certificate (the
+//                                     internal address replication-manager gives its apps)
 //   REPMAN_CLUSTER                    the cluster (namespace) whose addresses are monitored
 //   KUMA_ADMIN_USER, KUMA_ADMIN_PASSWORD  Kuma's admin, created at the first start
 //   SYNC_INTERVAL (60 s), MONITOR_INTERVAL (60 s), KUMA_URL (http://localhost:3001)
 //   SELF_HOST                         this app's own host, not monitored
 "use strict";
 const { io } = require("/app/node_modules/socket.io-client");
+const https = require("https");
+const http = require("http");
 
 const env = process.env;
 const KUMA_URL = env.KUMA_URL || "http://localhost:3001";
@@ -23,6 +27,7 @@ const PASSWORD = env.KUMA_ADMIN_PASSWORD || "";
 const SYNC_INTERVAL = Math.max(20, Number(env.SYNC_INTERVAL) || 60);
 const CHECK_INTERVAL = Math.max(20, Number(env.MONITOR_INTERVAL) || 60);
 const SELF_HOST = env.SELF_HOST || "";
+const TLS_VERIFY = String(env.REPMAN_API_TLS_VERIFY || "true").toLowerCase() !== "false";
 const MARK = `managed by kuma-sync (${CLUSTER})`;
 
 const log = (...a) => console.log(new Date().toISOString(), "kuma-sync:", ...a);
@@ -40,21 +45,39 @@ function call(sock, event, ...args) {
     });
 }
 
-async function api(path) {
-    let res;
-    try {
-        res = await fetch(API + path, {
+// api reads one replication-manager endpoint. node's https (not fetch) so a self-signed
+// certificate can be accepted for this API only (REPMAN_API_TLS_VERIFY=false).
+function api(path) {
+    const url = new URL(API + path);
+    const lib = url.protocol === "https:" ? https : http;
+    return new Promise((resolve, reject) => {
+        const req = lib.get(url, {
             headers: { Authorization: "Bearer " + TOKEN },
-            signal: AbortSignal.timeout(20000),
+            rejectUnauthorized: TLS_VERIFY,
+            timeout: 20000,
+        }, (res) => {
+            let body = "";
+            res.setEncoding("utf8");
+            res.on("data", (c) => {
+                body += c;
+                if (body.length > 32 * 1024 * 1024) {
+                    req.destroy(new Error("answer over 32 MB"));
+                }
+            });
+            res.on("end", () => {
+                if (res.statusCode < 200 || res.statusCode > 299) {
+                    return reject(new Error(`${path}: HTTP ${res.statusCode}`));
+                }
+                try {
+                    resolve(JSON.parse(body));
+                } catch (e) {
+                    reject(new Error(`${path}: ${e.message}`));
+                }
+            });
         });
-    } catch (e) {
-        // fetch only says "fetch failed": the cause (DNS, refused, TLS) is underneath
-        throw new Error(`${path}: ${(e.cause && (e.cause.code || e.cause.message)) || e.message}`);
-    }
-    if (!res.ok) {
-        throw new Error(`${path}: HTTP ${res.status}`);
-    }
-    return res.json();
+        req.on("timeout", () => req.destroy(new Error("timeout")));
+        req.on("error", (e) => reject(new Error(`${path}: ${e.code || e.message}`)));
+    });
 }
 
 // statusCodes turns a replication-manager expect-status ("200", "200,204") into Kuma's list.
