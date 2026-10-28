@@ -21,6 +21,10 @@
 //                                     databases, proxies), read-only; empty, none. Behind the
 //                                     SSO only its data stays open (start.sh), for a page
 //                                     elsewhere (the Cloud18 members zone) to show it
+//   EXTERNAL_MONITORS                 addresses outside the cluster, "name|https://url;name|url":
+//                                     one http check each (certificate verified), monitor
+//                                     "console <name>", group "Partner consoles" on the status
+//                                     page; empty, none
 "use strict";
 const { io } = require("/app/node_modules/socket.io-client");
 const fs = require("fs");
@@ -43,6 +47,10 @@ const SSO = env.SSO_ENABLED === "true";
 const SSO_EMAILS_FILE = env.SSO_EMAILS_FILE || "";
 const STATUS_PAGE_SLUG = /^[a-z0-9-]+$/.test(env.STATUS_PAGE_SLUG || "") ? env.STATUS_PAGE_SLUG : "";
 const STATUS_PAGE_TITLE = env.STATUS_PAGE_TITLE || STATUS_PAGE_SLUG;
+// "name|url" pairs; an entry without a name or an http(s) url is skipped
+const EXTERNAL = (env.EXTERNAL_MONITORS || "").split(";")
+    .map((e) => e.split("|").map((x) => x.trim()))
+    .filter(([name, url]) => name && /^https?:\/\/[^\s]+$/.test(url || ""));
 
 const log = (...a) => console.log(new Date().toISOString(), "kuma-sync:", ...a);
 const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
@@ -189,6 +197,10 @@ async function desired() {
             port(`proxy ${name} read`, p.host, p.readPort);
         }
     }
+    // outside the cluster (EXTERNAL_MONITORS): checked as a visitor reaches them, certificate included
+    for (const [name, url] of EXTERNAL) {
+        want.set(`console ${name}`, { type: "http", url, accepted_statuscodes: ["200-299"], ignoreTls: false, expiryNotification: false });
+    }
     return want;
 }
 
@@ -239,7 +251,7 @@ async function statusPage(sock, managed) {
     if (!STATUS_PAGE_SLUG) {
         return;
     }
-    const groups = [["Applications", "app "], ["Databases", "db "], ["Proxies", "proxy "]]
+    const groups = [["Applications", "app "], ["Databases", "db "], ["Proxies", "proxy "], ["Partner consoles", "console "]]
         .map(([name, prefix]) => ({
             name,
             monitorList: managed.filter((m) => m.name.startsWith(prefix))
