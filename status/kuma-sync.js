@@ -16,15 +16,17 @@
 //                                     file gets the emails of the cluster's users holding
 //                                     cluster-show-routes, and Kuma's own login is turned off;
 //                                     without SSO, Kuma's login is kept on
-//   STATUS_PAGE_SLUG, STATUS_PAGE_TITLE  a Kuma status page (letters, digits, dashes) kept
-//                                     with the managed monitors in three groups (applications,
-//                                     databases, proxies), read-only; empty, none. Behind the
-//                                     SSO only its data stays open (start.sh), for a page
-//                                     elsewhere (the Cloud18 members zone) to show it
+//   STATUS_PAGE_SLUG, STATUS_PAGE_TITLE  a Kuma status page (letters, digits, dashes), read-only;
+//                                     empty, none. Kuma owns its groups (made, renamed, ordered
+//                                     and filled in Kuma's editor): the sync only places a
+//                                     managed monitor that is in no group yet, in the default
+//                                     group of its kind (Applications, Databases, Proxies,
+//                                     Partner consoles), created when missing. Behind the SSO
+//                                     only its data stays open (start.sh), for a page elsewhere
+//                                     (the Cloud18 members zone) to show it
 //   EXTERNAL_MONITORS                 addresses outside the cluster, "name|https://url;name|url":
 //                                     one http check each (certificate verified), monitor
-//                                     "console <name>", group "Partner consoles" on the status
-//                                     page; empty, none
+//                                     "<name>", default group "Partner consoles"; empty, none
 "use strict";
 const { io } = require("/app/node_modules/socket.io-client");
 const fs = require("fs");
@@ -142,8 +144,16 @@ function noRouteCheck(app) {
 // and read ports.
 async function desired() {
     const want = new Map();
+    // the kind of each monitor (app, db, proxy, console): its default group on the status page
+    const kinds = new Map();
+    const set = (kind, name, f) => {
+        // monitors carry no kind prefix (the group says it); two kinds with one name stay apart
+        const key = want.has(name) ? `${name} (${kind})` : name;
+        want.set(key, f);
+        kinds.set(key, kind);
+    };
     const c = encodeURIComponent(CLUSTER);
-    const port = (name, hostname, p) => want.set(name, { type: "port", hostname, port: Number(p) });
+    const port = (kind, name, hostname, p) => set(kind, name, { type: "port", hostname, port: Number(p) });
 
     for (const app of await api(`/api/clusters/${c}/topology/apps`)) {
         if (!app.host || app.host === SELF_HOST) {
@@ -177,12 +187,12 @@ async function desired() {
             }
         }
         for (const [where, f] of checks) {
-            want.set(checks.size > 1 ? `app ${app.name} ${where}` : `app ${app.name}`, f);
+            set("app", checks.size > 1 ? `${app.name} ${where}` : app.name, f);
         }
     }
     for (const s of await api(`/api/clusters/${c}/topology/servers`)) {
         if (s.host && s.port) {
-            port(`db ${s.host.split(".")[0]}`, s.host, s.port);
+            port("db", s.host.split(".")[0], s.host, s.port);
         }
     }
     for (const p of await api(`/api/clusters/${c}/topology/proxies`)) {
@@ -191,17 +201,17 @@ async function desired() {
         }
         const name = p.host.split(".")[0];
         if (p.writePort) {
-            port(`proxy ${name} write`, p.host, p.writePort);
+            port("proxy", `${name} write`, p.host, p.writePort);
         }
         if (p.readPort && p.readPort !== p.writePort) {
-            port(`proxy ${name} read`, p.host, p.readPort);
+            port("proxy", `${name} read`, p.host, p.readPort);
         }
     }
     // outside the cluster (EXTERNAL_MONITORS): checked as a visitor reaches them, certificate included
     for (const [name, url] of EXTERNAL) {
-        want.set(`console ${name}`, { type: "http", url, accepted_statuscodes: ["200-299"], ignoreTls: false, expiryNotification: false });
+        set("console", name, { type: "http", url, accepted_statuscodes: ["200-299"], ignoreTls: false, expiryNotification: false });
     }
-    return want;
+    return { want, kinds };
 }
 
 // writeViewers writes the emails allowed through oauth2-proxy (one per line), replacing the file
@@ -244,22 +254,32 @@ async function kumaLogin(sock) {
     log(`Kuma's own login ${SSO ? "off (SSO in front)" : "on (no SSO)"}`);
 }
 
-// statusPage keeps the STATUS_PAGE_SLUG page listing the managed monitors, saved only when its
-// title or its monitors change (once at each start). Hand-made status pages are left alone.
-let statusPageSaved = "";
-async function statusPage(sock, managed) {
+// the default status page group of each kind of monitor
+const DEFAULT_GROUP = { app: "Applications", db: "Databases", proxy: "Proxies", console: "Partner consoles" };
+
+// kumaGet reads one of Kuma's own http endpoints (its public status page data).
+function kumaGet(path) {
+    return new Promise((resolve, reject) => {
+        http.get(KUMA_URL + path, (res) => {
+            let body = "";
+            res.on("data", (d) => (body += d));
+            res.on("end", () => {
+                try {
+                    res.statusCode === 200 ? resolve(JSON.parse(body)) : reject(new Error(`${path}: ${res.statusCode}`));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        }).on("error", reject);
+    });
+}
+
+// statusPage keeps the STATUS_PAGE_SLUG page. Kuma owns its groups: the sync reads them and only
+// places each managed monitor that is in no group yet, in the default group of its kind (created
+// when missing); groups, their names, order and members set in Kuma are kept. Saved only when a
+// monitor was placed. Hand-made status pages are left alone.
+async function statusPage(sock, managed, kinds, existing) {
     if (!STATUS_PAGE_SLUG) {
-        return;
-    }
-    const groups = [["Applications", "app "], ["Databases", "db "], ["Proxies", "proxy "], ["Partner consoles", "console "]]
-        .map(([name, prefix]) => ({
-            name,
-            monitorList: managed.filter((m) => m.name.startsWith(prefix))
-                .sort((a, b) => a.name.localeCompare(b.name)).map((m) => ({ id: m.id })),
-        }))
-        .filter((g) => g.monitorList.length);
-    const signature = JSON.stringify([STATUS_PAGE_TITLE, groups]);
-    if (signature === statusPageSaved) {
         return;
     }
     let page = await call(sock, "getStatusPage", STATUS_PAGE_SLUG);
@@ -274,15 +294,37 @@ async function statusPage(sock, managed) {
         }
         log(`status page ${STATUS_PAGE_SLUG} created`);
     }
+    const data = await kumaGet(`/api/status-page/${STATUS_PAGE_SLUG}`);
+    // the data may be cached by Kuma a few minutes: a monitor deleted since is dropped here
+    const groups = (data.publicGroupList || []).map((g) => ({
+        id: g.id,
+        name: g.name,
+        monitorList: (g.monitorList || []).filter((m) => existing.has(m.id)).map((m) => ({ id: m.id, sendUrl: m.sendUrl })),
+    }));
+    const placed = new Set(groups.flatMap((g) => g.monitorList.map((m) => m.id)));
+    let added = 0;
+    for (const m of [...managed].sort((a, b) => a.name.localeCompare(b.name))) {
+        const name = DEFAULT_GROUP[kinds.get(m.name)];
+        if (placed.has(m.id) || !name) {
+            continue;
+        }
+        let g = groups.find((x) => x.name === name);
+        if (!g) {
+            g = { name, monitorList: [] };
+            groups.push(g);
+        }
+        g.monitorList.push({ id: m.id });
+        added++;
+    }
+    if (!added) {
+        return;
+    }
     const cfg = page.config || {};
-    const r = await call(sock, "saveStatusPage", STATUS_PAGE_SLUG,
-        { ...cfg, slug: STATUS_PAGE_SLUG, title: STATUS_PAGE_TITLE, showTags: false, analyticsType: cfg.analyticsType || null },
-        cfg.icon || "", groups);
+    const r = await call(sock, "saveStatusPage", STATUS_PAGE_SLUG, { ...cfg, analyticsType: cfg.analyticsType || null }, cfg.icon || "", groups);
     if (!r || !r.ok) {
         throw new Error(`saveStatusPage: ${r && r.msg}`);
     }
-    statusPageSaved = signature;
-    log(`status page ${STATUS_PAGE_SLUG}: ${groups.reduce((n, g) => n + g.monitorList.length, 0)} monitors`);
+    log(`status page ${STATUS_PAGE_SLUG}: ${added} monitor(s) placed in their default group`);
 }
 
 function newMonitor(name, fields) {
@@ -370,10 +412,27 @@ async function session() {
         }
 
         // a failed read of the cluster changes nothing: never remove monitors on an API error
-        const want = await desired();
+        const { want, kinds } = await desired();
         const managed = Object.values(list).filter((m) => m.description === MARK);
         const byName = new Map(managed.map((m) => [m.name, m]));
-        let added = 0, edited = 0, removed = 0;
+        let added = 0, edited = 0, removed = 0, renamed = 0;
+        // monitors named by an older sync with their kind ("app x", "db x"...) are renamed in place:
+        // same monitor, its history kept
+        for (const m of managed) {
+            const name = m.name.replace(/^(app|db|proxy|console) /, "");
+            if (name === m.name || !want.has(name) || byName.has(name)) {
+                continue;
+            }
+            const res = await call(sock, "editMonitor", { ...m, name });
+            if (!res.ok) {
+                log(`rename ${m.name}: ${res.msg}`);
+                continue;
+            }
+            byName.delete(m.name);
+            m.name = name;
+            byName.set(name, m);
+            renamed++;
+        }
         for (const [name, f] of want) {
             const m = byName.get(name);
             if (!m) {
@@ -392,11 +451,11 @@ async function session() {
                 }
             }
         }
-        if (added || edited || removed) {
-            log(`${CLUSTER}: ${want.size} addresses, ${added} added, ${edited} changed, ${removed} removed`);
+        if (added || edited || removed || renamed) {
+            log(`${CLUSTER}: ${want.size} addresses, ${added} added, ${edited} changed, ${removed} removed, ${renamed} renamed`);
         }
         // the monitors as Kuma listed them at the start of this pass: one added now joins at the next
-        await statusPage(sock, managed.filter((m) => want.has(m.name)));
+        await statusPage(sock, managed.filter((m) => want.has(m.name)), kinds, new Set(Object.values(list).map((m) => m.id)));
     } finally {
         sock.close();
     }
