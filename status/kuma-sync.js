@@ -93,10 +93,38 @@ function statusCodes(expect) {
     return codes.length ? codes : ["200"];
 }
 
+// noRouteCheck: the check of an app without route, the way replication-manager runs it
+// (app-monitor-mode): http/https/https-cert a GET on the app host (a full name or an IP as is,
+// a short name on the cluster address) and port (left out when it is the scheme's default)
+// with its path and expected status, https-cert with the certificate checked; ping an ICMP
+// echo; port (default) a TCP connect on the cluster address.
+function noRouteCheck(app) {
+    const cfg = app.config || {};
+    const mode = String(cfg.appMonitorMode || "").trim().toLowerCase();
+    if (mode === "ping") {
+        return { type: "ping", hostname: app.host };
+    }
+    if (mode !== "http" && mode !== "https" && mode !== "https-cert") {
+        return app.port ? { type: "port", hostname: app.host, port: Number(app.port) } : null;
+    }
+    const scheme = mode === "http" ? "http" : "https";
+    const host = /[.:]/.test(cfg.appHost || "") ? cfg.appHost : app.host;
+    const port = String(cfg.appPort || app.port || "");
+    const defaultPort = (scheme === "https" && port === "443") || (scheme === "http" && port === "80");
+    return {
+        type: "http",
+        url: `${scheme}://${host}${defaultPort || !port ? "" : ":" + port}${cfg.appMonitorPath || "/"}`,
+        accepted_statuscodes: statusCodes(cfg.appMonitorExpectStatus),
+        ignoreTls: mode !== "https-cert",
+        expiryNotification: mode === "https-cert",
+    };
+}
+
 // desired reads the cluster from replication-manager: name -> monitor fields. An app is checked
 // on each http route the way replication-manager checks it (its monitor path and expected
-// status, on the internal host and destination port), a tcp route or an app without route on
-// its port; a database server on its port; a proxy on its write and read ports.
+// status, on the internal host and destination port), a tcp route on its port, an app without
+// route by its monitor mode (noRouteCheck); a database server on its port; a proxy on its write
+// and read ports.
 async function desired() {
     const want = new Map();
     const c = encodeURIComponent(CLUSTER);
@@ -127,8 +155,11 @@ async function desired() {
                 checks.set(`:${p}`, { type: "port", hostname: app.host, port: Number(p) });
             }
         }
-        if (!checks.size && app.port) {
-            checks.set(`:${app.port}`, { type: "port", hostname: app.host, port: Number(app.port) });
+        if (!checks.size) {
+            const f = noRouteCheck(app);
+            if (f) {
+                checks.set(`:${app.port}`, f);
+            }
         }
         for (const [where, f] of checks) {
             want.set(checks.size > 1 ? `app ${app.name} ${where}` : `app ${app.name}`, f);
@@ -226,7 +257,12 @@ function changed(m, f) {
         return true;
     }
     if (f.type === "http") {
-        return m.url !== f.url || JSON.stringify(m.accepted_statuscodes) !== JSON.stringify(f.accepted_statuscodes);
+        return m.url !== f.url || JSON.stringify(m.accepted_statuscodes) !== JSON.stringify(f.accepted_statuscodes) ||
+            (f.ignoreTls !== undefined && Boolean(m.ignoreTls) !== f.ignoreTls) ||
+            (f.expiryNotification !== undefined && Boolean(m.expiryNotification) !== f.expiryNotification);
+    }
+    if (f.type === "ping") {
+        return m.hostname !== f.hostname;
     }
     return m.hostname !== f.hostname || Number(m.port) !== f.port;
 }
