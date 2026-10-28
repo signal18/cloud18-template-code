@@ -8,6 +8,11 @@
 # sync writes there the cluster's users holding cluster-show-routes in replication-manager.
 # /api/entry-page stays open for the route monitor. A failed oauth2-proxy download leaves
 # nothing on the app port: the page is down, never open.
+# STATUS_PAGE_SLUG (letters, digits, dashes): the sync keeps that Kuma status page; behind the SSO
+# its read-only data (GET /api/status-page/<slug> and /api/status-page/heartbeat/<slug>: monitor
+# names and up/down, no address) stays open for a page elsewhere to show it, nothing else does.
+case "$STATUS_PAGE_SLUG" in *[!a-z0-9-]*) STATUS_PAGE_SLUG= ;; esac
+export STATUS_PAGE_SLUG
 OAUTH2_PROXY_VERSION=v7.15.5
 OAUTH2_PROXY_SHA256=f63f94bf72c5f46ab002a0a275aa8b3cf19b4d828aed08a13978cb9a62c3a1fd
 
@@ -29,6 +34,10 @@ if [ -n "$OIDC_ISSUER_URL" ] && [ -n "$OIDC_CLIENT_ID" ] && [ -n "$OIDC_CLIENT_S
         OAUTH2_PROXY_CLIENT_SECRET="$OIDC_CLIENT_SECRET" \
         OAUTH2_PROXY_COOKIE_SECRET="$(node -e 'process.stdout.write(require("crypto").randomBytes(16).toString("hex"))')"
         export OAUTH2_PROXY_CLIENT_SECRET OAUTH2_PROXY_COOKIE_SECRET
+        set --
+        if [ -n "$STATUS_PAGE_SLUG" ]; then
+            set -- "--skip-auth-route=GET=^/api/status-page/(heartbeat/)?$STATUS_PAGE_SLUG\$"
+        fi
         while true; do
             "$bin" \
                 --http-address=0.0.0.0:3001 \
@@ -43,7 +52,8 @@ if [ -n "$OIDC_ISSUER_URL" ] && [ -n "$OIDC_CLIENT_ID" ] && [ -n "$OIDC_CLIENT_S
                 --skip-auth-route='GET=^/api/entry-page$' \
                 --reverse-proxy=true \
                 --cookie-secure=true \
-                --cookie-name=_status_sso
+                --cookie-name=_status_sso \
+                "$@"
             echo "oauth2-proxy exited, restarting in 10s"
             sleep 10
         done

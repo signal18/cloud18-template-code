@@ -16,6 +16,11 @@
 //                                     file gets the emails of the cluster's users holding
 //                                     cluster-show-routes, and Kuma's own login is turned off;
 //                                     without SSO, Kuma's login is kept on
+//   STATUS_PAGE_SLUG, STATUS_PAGE_TITLE  a Kuma status page (letters, digits, dashes) kept
+//                                     with the managed monitors in three groups (applications,
+//                                     databases, proxies), read-only; empty, none. Behind the
+//                                     SSO only its data stays open (start.sh), for a page
+//                                     elsewhere (the Cloud18 members zone) to show it
 "use strict";
 const { io } = require("/app/node_modules/socket.io-client");
 const fs = require("fs");
@@ -36,6 +41,8 @@ const TLS_VERIFY = String(env.REPMAN_API_TLS_VERIFY || "true").toLowerCase() !==
 const MARK = `managed by kuma-sync (${CLUSTER})`;
 const SSO = env.SSO_ENABLED === "true";
 const SSO_EMAILS_FILE = env.SSO_EMAILS_FILE || "";
+const STATUS_PAGE_SLUG = /^[a-z0-9-]+$/.test(env.STATUS_PAGE_SLUG || "") ? env.STATUS_PAGE_SLUG : "";
+const STATUS_PAGE_TITLE = env.STATUS_PAGE_TITLE || STATUS_PAGE_SLUG;
 
 const log = (...a) => console.log(new Date().toISOString(), "kuma-sync:", ...a);
 const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
@@ -225,6 +232,47 @@ async function kumaLogin(sock) {
     log(`Kuma's own login ${SSO ? "off (SSO in front)" : "on (no SSO)"}`);
 }
 
+// statusPage keeps the STATUS_PAGE_SLUG page listing the managed monitors, saved only when its
+// title or its monitors change (once at each start). Hand-made status pages are left alone.
+let statusPageSaved = "";
+async function statusPage(sock, managed) {
+    if (!STATUS_PAGE_SLUG) {
+        return;
+    }
+    const groups = [["Applications", "app "], ["Databases", "db "], ["Proxies", "proxy "]]
+        .map(([name, prefix]) => ({
+            name,
+            monitorList: managed.filter((m) => m.name.startsWith(prefix))
+                .sort((a, b) => a.name.localeCompare(b.name)).map((m) => ({ id: m.id })),
+        }))
+        .filter((g) => g.monitorList.length);
+    const signature = JSON.stringify([STATUS_PAGE_TITLE, groups]);
+    if (signature === statusPageSaved) {
+        return;
+    }
+    let page = await call(sock, "getStatusPage", STATUS_PAGE_SLUG);
+    if (!page || !page.ok) {
+        const r = await call(sock, "addStatusPage", STATUS_PAGE_TITLE, STATUS_PAGE_SLUG);
+        if (!r || !r.ok) {
+            throw new Error(`addStatusPage: ${r && r.msg}`);
+        }
+        page = await call(sock, "getStatusPage", STATUS_PAGE_SLUG);
+        if (!page || !page.ok) {
+            throw new Error(`getStatusPage: ${page && page.msg}`);
+        }
+        log(`status page ${STATUS_PAGE_SLUG} created`);
+    }
+    const cfg = page.config || {};
+    const r = await call(sock, "saveStatusPage", STATUS_PAGE_SLUG,
+        { ...cfg, slug: STATUS_PAGE_SLUG, title: STATUS_PAGE_TITLE, showTags: false, analyticsType: cfg.analyticsType || null },
+        cfg.icon || "", groups);
+    if (!r || !r.ok) {
+        throw new Error(`saveStatusPage: ${r && r.msg}`);
+    }
+    statusPageSaved = signature;
+    log(`status page ${STATUS_PAGE_SLUG}: ${groups.reduce((n, g) => n + g.monitorList.length, 0)} monitors`);
+}
+
 function newMonitor(name, fields) {
     return {
         name,
@@ -335,6 +383,8 @@ async function session() {
         if (added || edited || removed) {
             log(`${CLUSTER}: ${want.size} addresses, ${added} added, ${edited} changed, ${removed} removed`);
         }
+        // the monitors as Kuma listed them at the start of this pass: one added now joins at the next
+        await statusPage(sock, managed.filter((m) => want.has(m.name)));
     } finally {
         sock.close();
     }
